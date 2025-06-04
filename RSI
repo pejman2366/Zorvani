@@ -1,0 +1,263 @@
+//@version=5
+indicator("🧠 Zarvān | RSI-NORMALIZE", overlay=false)
+
+// ╭────────────────────────────────────╮
+// │ UTILITY FUNCTIONS                  │
+// ╰────────────────────────────────────╯
+clamp(val, min, max) => math.max(min, math.min(val, max))
+normalize_to_range(val, min_val, max_val) =>
+    local_range = max_val - min_val
+    local_clamped = clamp(val, min_val, max_val)
+    200 * (local_clamped - min_val) / local_range - 100
+
+ema_dynamic(src, len) =>
+    alpha = 2.0 / (len + 1)
+    var float result = na
+    result := na(result[1]) ? src : result[1] + alpha * (src - result[1])
+    result
+
+nonlinear(x, gamma) =>
+    math.sign(x) * math.pow(math.abs(x), gamma)
+
+tanh(x) =>
+    (math.exp(x) - math.exp(-x)) / (math.exp(x) + math.exp(-x))
+
+// ╭────────────────────────────────────╮
+// │ MODULE 1: RSI Nāwah                │
+// ╰────────────────────────────────────╯
+smoothFactor = input.float(0.2, title="Jelatin Smooth Factor", minval=0.01, maxval=1.0)
+nonlinearPower = input.float(1.3, title="Nonlinear Exponent γ", minval=1.0, maxval=3.0)
+
+price_diff = close - close[1]
+trend_raw = ema_dynamic(price_diff, 10)
+accel_raw = trend_raw - trend_raw[1]
+echo_like = ema_dynamic(close - close[3], 10)
+
+trend_smooth = ema_dynamic(trend_raw, math.round(smoothFactor * 10))
+accel_smooth = ema_dynamic(accel_raw, math.round(smoothFactor * 5))
+echo_smooth = ema_dynamic(clamp(echo_like, -5, 5), math.round(smoothFactor * 8))
+
+wt_trend = math.abs(trend_smooth) / (math.abs(trend_smooth[1]) + 0.0001)
+wt_accel = math.abs(accel_smooth) / (math.abs(trend_smooth - trend_smooth[1]) + 0.0001)
+wt_echo  = math.abs(echo_smooth) / (math.abs(trend_smooth) + math.abs(echo_smooth[1]) + 0.0001)
+
+core_rsi = (trend_smooth * wt_trend + accel_smooth * wt_accel + echo_smooth * wt_echo) / 3
+zrm_base = ema_dynamic(volume, 20)
+zrm_spike = volume / zrm_base
+zrm_weight_safe = clamp(zrm_spike, 0.8, 1.8)
+RSI_Nawah = ema_dynamic(nonlinear(core_rsi * zrm_weight_safe, nonlinearPower), 3)
+
+field_signal_raw = (ema_dynamic(trend_smooth[1], 3) * 1.0 + ema_dynamic(accel_smooth[2], 2) * 0.6 + ema_dynamic(echo_smooth[1], 2) * 0.4) / 2.0
+signal_memory = ema_dynamic(field_signal_raw, 14)
+pulse = ema_dynamic(math.abs(RSI_Nawah - RSI_Nawah[1]), 3)
+pulse_factor = clamp(1.0 - pulse, 0.3, 1.0)
+RSI_Nawah_zrowan_signal = signal_memory * pulse_factor
+// نرمال‌سازی تطبیقی پویا
+RSI_mean = ta.sma(RSI_Nawah_zrowan_signal, 100)
+RSI_stdev = ta.stdev(RSI_Nawah_zrowan_signal, 100)
+RSI_zscore = (RSI_Nawah_zrowan_signal - RSI_mean) / (RSI_stdev + 1e-5)
+scale_param = input.float(0.33, title="Normalization Softness", minval=0.1, maxval=1.5, step=0.01)
+RSI_Nawah_normalized = 85 * tanh(RSI_zscore * scale_param)
+
+plot(RSI_Nawah_normalized, title="RSI Nāwah | ZROWAN Signal (Norm)", color=color.white, linewidth=2)
+
+// ╭────────────────────╮
+// │ Inputs             │
+// ╰────────────────────╯
+bias_threshold = input.int(15, title="Bias Threshold for Valid Signal")
+sf_volume = input.float(0.3, title="Smooth Factor - Volume")
+sf_redk   = input.float(0.25, title="Smooth Factor - RedK")
+
+// ╭──────────────------------------──────╮
+// │ تابع نرمال‌ساز لگاریتمی              │
+// ╰──────────------------------──────────╯
+normalize_log(val) =>
+    math.log(1 + math.abs(val)) * math.sign(val)
+
+// ╭────────────────────────────╮
+// │ EMA چندلایه با منطق زروانی  │
+// ╰────────────────────────────╯
+get_dynamic_weights(sf) =>
+    w_fast = 0.5 - 0.3 * sf
+    w_mid  = 0.3
+    w_slow = 1.0 - w_fast - w_mid
+    [w_fast, w_mid, w_slow]
+
+ema_zrowan(src, sf) =>
+    [w_fast, w_mid, w_slow] = get_dynamic_weights(sf)
+    ema_fast = ta.ema(src, 3)
+    ema_mid  = ta.ema(src, 6)
+    ema_slow = ta.ema(src, 9)
+    blend = ema_fast * w_fast + ema_mid * w_mid + ema_slow * w_slow
+    ta.ema(blend, math.round(10 + 20 * sf))
+
+// ╭────────────────────╮
+// │ Volume Bias        │
+// ╰────────────────────╯
+bar_flow_vol = (volume - volume[1]) * (close > open ? 1 : close < open ? -1 : 0)
+vol_bulls = math.max(bar_flow_vol, 0)
+vol_bears = -1 * math.min(bar_flow_vol, 0)
+vol_bull_avg = ema_zrowan(vol_bulls, sf_volume)
+vol_bear_avg = ema_zrowan(vol_bears, sf_volume)
+dx_vol = vol_bull_avg / vol_bear_avg
+volume_bias = 2 * (100 - 100 / (1 + dx_vol)) - 100
+volume_bias_s = ema_zrowan(volume_bias, sf_volume)
+
+// ╭────────────────────╮
+// │ RedK Bias          │
+// ╰────────────────────╯
+bar_spread = close - open
+bar_range = high - low
+spread_ratio = bar_spread / bar_range
+bar_closing = 2 * (close - low) / bar_range - 1
+price_move = (bar_closing + spread_ratio) / 2
+n_vol = volume / ema_zrowan(volume, sf_redk)
+bar_flow_redk = price_move * n_vol
+redk_bulls = math.max(bar_flow_redk, 0)
+redk_bears = -1 * math.min(bar_flow_redk, 0)
+redk_bull_avg = ema_zrowan(redk_bulls, sf_redk)
+redk_bear_avg = ema_zrowan(redk_bears, sf_redk)
+dx_redk = redk_bull_avg / redk_bear_avg
+redk_bias = 2 * (100 - 100 / (1 + dx_redk)) - 100
+
+// ╭──────────────────────────────╮
+// │ Adaptive ZROWAN Weighting    │
+// ╰──────────────────────────────╯
+var_vol_bias = ta.stdev(volume_bias_s, 20)
+var_redk_bias = ta.stdev(redk_bias, 20)
+sum_var = var_vol_bias + var_redk_bias + 1e-5
+
+weight_vol_bias = var_redk_bias / sum_var
+weight_redk_bias = var_vol_bias / sum_var
+
+// ╭────────────────────╮
+// │ Final Adaptive Combo │
+// ╰────────────────────╯
+bias_combo = weight_vol_bias * volume_bias_s + weight_redk_bias * redk_bias
+bias_mean = ema_zrowan(bias_combo, sf_redk)
+
+// ╭────────────────────╮
+// │ Plot Final Outputs │
+// ╰────────────────────╯
+//plot(bias_combo, title="ZR-Bias Combo", color=color.gray, linewidth=2)
+
+plot(RSI_Nawah_normalized, title="RSI Nāwah | ZROWAN Signal (Norm)", color=RSI_Nawah_normalized > bias_mean ? color.blue : color.orange, linewidth=2)
+hline(0, "Zero Line", color=color.gray)
+hline(85, "hi", color=color.gray)
+hline(-85, "low", color=color.gray)
+
+
+
+
+
+// ╭──────────────────────────────────────────╮
+// │ Divergence Detection (zcore)             │
+// ╰──────────────────────────────────────────╯
+
+macd_div_pivot_len      = input.int(2, title="ZCORE Pivot Strength (Bars)")
+macd_div_pivot_strength = input.float(0.02, title="ZCORE Minimum Pivot Strength (%)")
+macd_div_sensitivity    = input.int(20, title="ZCORE Divergence Sensitivity")
+macd_div_min_strength   = input.float(0.2, title="ZCORE Minimum Divergence Strength", step=0.05)
+macd_div_max_lookback   = input.int(100, title="ZCORE Max Lookback Bars")
+
+var float[] macd_highs = array.new_float()
+var int[]   macd_high_bars = array.new_int()
+var float[] macd_lows = array.new_float()
+var int[]   macd_low_bars = array.new_int()
+
+// قله قوی
+is_macd_strong_high(src, len, min_strength) =>
+    ph = ta.pivothigh(src, len, len)
+    if not na(ph)
+        left = src[len * 2]
+        right = src[0]
+        strength_left = (ph - left) / math.max(math.abs(left), 1e-5)
+        strength_right = (ph - right) / math.max(math.abs(right), 1e-5)
+        strength_left > min_strength and strength_right > min_strength
+    else
+        false
+
+// دره قوی
+is_macd_strong_low(src, len, min_strength) =>
+    pl = ta.pivotlow(src, len, len)
+    if not na(pl)
+        left = src[len * 2]
+        right = src[0]
+        strength_left = (left - pl) / math.max(math.abs(left), 1e-5)
+        strength_right = (right - pl) / math.max(math.abs(right), 1e-5)
+        strength_left > min_strength and strength_right > min_strength
+    else
+        false
+
+macd_high_now = is_macd_strong_high(RSI_Nawah_normalized, macd_div_pivot_len, macd_div_pivot_strength)
+macd_low_now  = is_macd_strong_low(RSI_Nawah_normalized, macd_div_pivot_len, macd_div_pivot_strength)
+
+// ثبت نقاط
+if bar_index > 2 * macd_div_pivot_len
+    if macd_high_now
+        array.unshift(macd_highs, RSI_Nawah_normalized[macd_div_pivot_len])
+        array.unshift(macd_high_bars, bar_index - macd_div_pivot_len)
+    if macd_low_now
+        array.unshift(macd_lows, RSI_Nawah_normalized[macd_div_pivot_len])
+        array.unshift(macd_low_bars, bar_index - macd_div_pivot_len)
+
+if array.size(macd_highs) > 50
+    array.pop(macd_highs)
+    array.pop(macd_high_bars)
+
+if array.size(macd_lows) > 50
+    array.pop(macd_lows)
+    array.pop(macd_low_bars)
+
+// سیگنال نرم خط (برای threshold واگرایی)
+macd_signal = ta.ema(RSI_Nawah_normalized, 10)
+
+// تابع رسم دایورجنس برای RSI_Nawah_normalized
+draw_macd_divergences(pivots, bars, is_high, is_hidden) =>
+    if array.size(pivots) > 1
+        curr_val = array.get(pivots, 0)
+        curr_bar = array.get(bars, 0)
+        for i = 1 to array.size(pivots) - 1
+            prev_val = array.get(pivots, i)
+            prev_bar = array.get(bars, i)
+            time_diff = curr_bar - prev_bar
+            if time_diff > 0 and time_diff <= macd_div_max_lookback
+                bars_ago_curr = bar_index - curr_bar
+                bars_ago_prev = bar_index - prev_bar
+                if bars_ago_curr >= 0 and bars_ago_prev >= 0 and bars_ago_curr < 5000 and bars_ago_prev < 5000
+                    divergence_price_move = math.abs(close[bars_ago_curr] - close[bars_ago_prev])
+                    divergence_macd_move = math.abs(curr_val - prev_val)
+                    strength_ratio = divergence_macd_move / math.max(divergence_price_move, 1e-5)
+                    strength_clamped = math.min(math.max(strength_ratio, 0), 2.5)
+                    if strength_clamped >= macd_div_min_strength
+                        width_final = math.round(1 + 2 * strength_clamped)-4
+                        transparency_final = math.round(90 - 35 * strength_clamped)
+                        
+                        if not is_hidden
+                            // واگرایی معمولی
+                            if is_high and curr_val < prev_val and curr_val > 0.05 and prev_val > 0.05 and curr_val > macd_signal and prev_val > macd_signal
+                                line.new(x1=prev_bar, y1=prev_val, x2=curr_bar, y2=curr_val, color=color.new(#FF0000, transparency_final), width=width_final)
+                                label.new(x=prev_bar, y=prev_val, text="D↘", style=label.style_label_down, color=color.new(#FF0000, 70), textcolor=color.white, size=size.small)
+                                break
+                            if not is_high and curr_val > prev_val and curr_val < -0.05 and prev_val < -0.05 and curr_val < macd_signal and prev_val < macd_signal
+                                line.new(x1=prev_bar, y1=prev_val, x2=curr_bar, y2=curr_val, color=color.new(#00AAFF, transparency_final), width=width_final)
+                                label.new(x=prev_bar, y=prev_val, text="D↗", style=label.style_label_up, color=color.new(#00AAFF, 70), textcolor=color.white, size=size.small)
+                                break
+                        else
+                            // واگرایی مخفی
+                            if is_high and close[bars_ago_curr] < close[bars_ago_prev] and curr_val > prev_val and curr_val > macd_signal and prev_val > macd_signal
+                                line.new(x1=prev_bar, y1=prev_val, x2=curr_bar, y2=curr_val, color=color.new(#FFA500, transparency_final), width=width_final, style=line.style_dotted)
+                                label.new(x=prev_bar, y=prev_val, text="↘H", style=label.style_label_down, color=color.new(#FFA500, 70), textcolor=color.white, size=size.small)
+                                break
+                            if not is_high and close[bars_ago_curr] > close[bars_ago_prev] and curr_val < prev_val and curr_val < macd_signal and prev_val < macd_signal
+                                line.new(x1=prev_bar, y1=prev_val, x2=curr_bar, y2=curr_val, color=color.new(#66FF66, transparency_final), width=width_final, style=line.style_dotted)
+                                label.new(x=prev_bar, y=prev_val, text="↗H", style=label.style_label_up, color=color.new(#66FF66, 70), textcolor=color.white, size=size.small)
+                                break
+
+// اجرا و رسم دایورجنس‌ها
+if bar_index > 2 * macd_div_pivot_len
+   // draw_macd_divergences(macd_highs, macd_high_bars, true, false)
+   // draw_macd_divergences(macd_lows, macd_low_bars, false, false)
+    draw_macd_divergences(macd_highs, macd_high_bars, true, true)
+    draw_macd_divergences(macd_lows, macd_low_bars, false, true)
+
